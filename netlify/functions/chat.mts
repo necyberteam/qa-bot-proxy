@@ -59,27 +59,20 @@ async function validateTurnstile(
   return res.json() as Promise<SiteverifyResponse>;
 }
 
-function jsonError(message: string, status: number): Response {
-  return new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-  });
+function getCorsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin") || "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-API-KEY, X-Session-ID, X-Query-ID",
+    "Access-Control-Allow-Credentials": "true",
+  };
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-API-KEY, X-Session-ID, X-Query-ID",
-};
-
-function withCors(response: Response): Response {
-  const headers = new Headers(response.headers);
-  for (const [key, value] of Object.entries(CORS_HEADERS)) {
-    headers.set(key, value);
-  }
-  return new Response(response.body, {
-    status: response.status,
-    headers,
+function jsonResponse(data: object, status: number, cors: Record<string, string>): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...cors },
   });
 }
 
@@ -87,19 +80,21 @@ export default async function handler(
   request: Request,
   context: Context
 ): Promise<Response> {
+  const cors = getCorsHeaders(request);
+
   // Handle CORS preflight
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { status: 204, headers: cors });
   }
 
   if (request.method !== "POST") {
-    return withCors(jsonError("Method not allowed", 405));
+    return jsonResponse({ error: "Method not allowed" }, 405, cors);
   }
 
   const secretKey = process.env.TURNSTILE_SECRET_KEY;
   if (!secretKey) {
     console.error("TURNSTILE_SECRET_KEY not configured");
-    return jsonError("Server misconfigured", 500);
+    return jsonResponse({ error: "Server misconfigured" }, 500, cors);
   }
 
   // TURNSTILE_SITE_KEY is the public site key — used in challenge responses
@@ -109,24 +104,24 @@ export default async function handler(
   const backendMap = getBackendMap();
   if (backendMap.size === 0) {
     console.error("ALLOWED_BACKENDS not configured");
-    return jsonError("Server misconfigured", 500);
+    return jsonResponse({ error: "Server misconfigured" }, 500, cors);
   }
 
   let body: Record<string, unknown>;
   try {
     body = await request.json();
   } catch {
-    return jsonError("Invalid JSON body", 400);
+    return jsonResponse({ error: "Invalid JSON body" }, 400, cors);
   }
 
   // Resolve backend ID to URL — client never sends a URL
   const backendId = body._backend as string | undefined;
   if (!backendId) {
-    return jsonError("Missing _backend", 403);
+    return jsonResponse({ error: "Missing _backend" }, 403, cors);
   }
   const targetUrl = backendMap.get(backendId);
   if (!targetUrl) {
-    return jsonError("Unknown backend: " + backendId, 403);
+    return jsonResponse({ error: "Unknown backend: " + backendId }, 403, cors);
   }
 
   // --- Turnstile validation ---
@@ -139,12 +134,9 @@ export default async function handler(
 
   if (!turnstileToken) {
     if (siteKey) {
-      return new Response(
-        JSON.stringify({ requires_turnstile: true, site_key: siteKey }),
-        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
-      );
+      return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
     }
-    return jsonError("Missing turnstile_token", 403);
+    return jsonResponse({ error: "Missing turnstile_token" }, 403, cors);
   }
 
   let verification: SiteverifyResponse;
@@ -156,7 +148,7 @@ export default async function handler(
     );
   } catch (err) {
     console.error("Turnstile siteverify request failed:", err);
-    return jsonError("Turnstile service unavailable", 502);
+    return jsonResponse({ error: "Turnstile service unavailable" }, 502, cors);
   }
 
   if (!verification.success) {
@@ -166,23 +158,15 @@ export default async function handler(
     );
     // Return challenge so user can retry with visible widget
     if (siteKey) {
-      return new Response(
-        JSON.stringify({ requires_turnstile: true, site_key: siteKey }),
-        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
-      );
+      return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
     }
-    return jsonError("Turnstile verification failed", 403);
+    return jsonResponse({ error: "Turnstile verification failed" }, 403, cors);
   }
 
   // Strip proxy-only fields before forwarding
   const { turnstile_token, _backend, ...forwardBody } = body;
 
   // Forward safe headers to backend.
-  // Currently whitelists the headers qa-bot-core sends today.
-  // If backends start requiring additional headers (Authorization,
-  // custom x-* headers), expand this list or switch to forwarding
-  // all headers except hop-by-hop ones (connection, keep-alive,
-  // transfer-encoding, etc.).
   const forwardHeaders: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -200,7 +184,7 @@ export default async function handler(
     });
   } catch (err) {
     console.error("Backend request failed:", err);
-    return jsonError("Failed to reach backend", 502);
+    return jsonResponse({ error: "Failed to reach backend" }, 502, cors);
   }
 
   // Build response headers — pass through content type and cookies
@@ -208,6 +192,7 @@ export default async function handler(
     "Content-Type":
       backendResponse.headers.get("Content-Type") ?? "application/json",
     "Cache-Control": "no-cache",
+    ...cors,
   };
   const setCookie = backendResponse.headers.get("set-cookie");
   if (setCookie) {
@@ -216,6 +201,6 @@ export default async function handler(
 
   return new Response(backendResponse.body, {
     status: backendResponse.status,
-    headers: { ...responseHeaders, ...CORS_HEADERS },
+    headers: responseHeaders,
   });
 }
