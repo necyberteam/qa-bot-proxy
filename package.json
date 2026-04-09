@@ -1,0 +1,13 @@
+{
+  "name": "@snf/qa-bot-proxy",
+  "version": "0.1.0",
+  "description": "Turnstile-validating proxy for qa-bot-core deployments",
+  "private": true,
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^5.2.0",
+    "vitest": "^4.1.4"
+  }
+}
