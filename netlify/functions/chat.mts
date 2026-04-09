@@ -62,7 +62,24 @@ async function validateTurnstile(
 function jsonError(message: string, status: number): Response {
   return new Response(JSON.stringify({ error: message }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-API-KEY, X-Session-ID, X-Query-ID",
+};
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) {
+    headers.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    headers,
   });
 }
 
@@ -70,8 +87,13 @@ export default async function handler(
   request: Request,
   context: Context
 ): Promise<Response> {
+  // Handle CORS preflight
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
   if (request.method !== "POST") {
-    return jsonError("Method not allowed", 405);
+    return withCors(jsonError("Method not allowed", 405));
   }
 
   const secretKey = process.env.TURNSTILE_SECRET_KEY;
@@ -119,7 +141,7 @@ export default async function handler(
     if (siteKey) {
       return new Response(
         JSON.stringify({ requires_turnstile: true, site_key: siteKey }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
+        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
       );
     }
     return jsonError("Missing turnstile_token", 403);
@@ -146,7 +168,7 @@ export default async function handler(
     if (siteKey) {
       return new Response(
         JSON.stringify({ requires_turnstile: true, site_key: siteKey }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
+        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
       );
     }
     return jsonError("Turnstile verification failed", 403);
@@ -194,6 +216,6 @@ export default async function handler(
 
   return new Response(backendResponse.body, {
     status: backendResponse.status,
-    headers: responseHeaders,
+    headers: { ...responseHeaders, ...CORS_HEADERS },
   });
 }
