@@ -64,7 +64,7 @@ function getCorsHeaders(request: Request): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-API-KEY, X-Session-ID, X-Query-ID",
+    "Access-Control-Allow-Headers": "Content-Type, X-API-KEY, X-Session-ID, X-Query-ID, X-Origin",
     "Access-Control-Allow-Credentials": "true",
   };
 }
@@ -170,7 +170,7 @@ export default async function handler(
   const forwardHeaders: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  for (const key of ["x-api-key", "x-session-id", "x-query-id", "cookie"]) {
+  for (const key of ["x-api-key", "x-session-id", "x-query-id", "x-origin", "cookie"]) {
     const val = request.headers.get(key);
     if (val) forwardHeaders[key] = val;
   }
