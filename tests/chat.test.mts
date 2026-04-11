@@ -31,8 +31,9 @@ describe("chat proxy function", () => {
   beforeEach(() => {
     process.env = {
       ...originalEnv,
-      TURNSTILE_SECRET_KEY: "test-secret",
-      TURNSTILE_SITE_KEY: "test-site-key",
+      // Per-backend Turnstile keys
+      TURNSTILE_SECRET_KEYS: "nairr=nairr-secret,other=other-secret",
+      TURNSTILE_SITE_KEYS: "nairr=nairr-site-key,other=other-site-key",
       ALLOWED_BACKENDS: "nairr=https://api.example.com/nairr/chat/,other=https://api.other.com/chat/",
     };
     // Mock global fetch for Turnstile siteverify and backend calls
@@ -51,7 +52,8 @@ describe("chat proxy function", () => {
     expect(res.status).toBe(405);
   });
 
-  it("returns 500 when TURNSTILE_SECRET_KEY is missing", async () => {
+  it("returns 500 when no Turnstile secret key exists for backend", async () => {
+    delete process.env.TURNSTILE_SECRET_KEYS;
     delete process.env.TURNSTILE_SECRET_KEY;
     const handler = await loadHandler();
     const req = makeRequest("POST", { _backend: "nairr", turnstile_token: "tok" });
@@ -96,17 +98,17 @@ describe("chat proxy function", () => {
     expect(res.status).toBe(403);
   });
 
-  it("returns requires_turnstile challenge when turnstile_token is missing", async () => {
+  it("returns requires_turnstile challenge with per-backend site key when token is missing", async () => {
     const handler = await loadHandler();
     const req = makeRequest("POST", { _backend: "nairr", query: "hi" });
     const res = await handler(req, fakeContext);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.requires_turnstile).toBe(true);
-    expect(body.site_key).toBe("test-site-key");
+    expect(body.site_key).toBe("nairr-site-key");
   });
 
-  it("returns requires_turnstile challenge when Turnstile verification fails", async () => {
+  it("returns requires_turnstile challenge with per-backend site key when verification fails", async () => {
     const mockFetch = vi.fn().mockResolvedValueOnce(
       new Response(JSON.stringify({ success: false, "error-codes": ["invalid-input-response"] }), {
         headers: { "Content-Type": "application/json" },
@@ -124,10 +126,57 @@ describe("chat proxy function", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.requires_turnstile).toBe(true);
-    expect(body.site_key).toBe("test-site-key");
+    expect(body.site_key).toBe("nairr-site-key");
   });
 
-  it("returns hard 403 when TURNSTILE_SITE_KEY is not configured and token fails", async () => {
+  it("falls back to global TURNSTILE_SECRET_KEY when per-backend key is missing", async () => {
+    // Remove per-backend keys, set global fallback
+    process.env.TURNSTILE_SECRET_KEYS = "";
+    process.env.TURNSTILE_SECRET_KEY = "global-secret";
+    process.env.TURNSTILE_SITE_KEYS = "";
+    process.env.TURNSTILE_SITE_KEY = "global-site-key";
+
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ response: "ok" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const handler = await loadHandler();
+    const req = makeRequest("POST", {
+      _backend: "nairr",
+      turnstile_token: "tok",
+      query: "hi",
+    });
+    const res = await handler(req, fakeContext);
+    expect(res.status).toBe(200);
+
+    // Verify global secret was used for validation
+    const siteverifyBody = new URLSearchParams(mockFetch.mock.calls[0][1].body.toString());
+    expect(siteverifyBody.get("secret")).toBe("global-secret");
+  });
+
+  it("uses different Turnstile keys for different backends", async () => {
+    const handler = await loadHandler();
+
+    // Request with no token for "nairr" should get nairr's site key
+    const nairrReq = makeRequest("POST", { _backend: "nairr", query: "hi" });
+    const nairrRes = await handler(nairrReq, fakeContext);
+    const nairrBody = await nairrRes.json();
+    expect(nairrBody.site_key).toBe("nairr-site-key");
+
+    // Request with no token for "other" should get other's site key
+    const otherReq = makeRequest("POST", { _backend: "other", query: "hi" });
+    const otherRes = await handler(otherReq, fakeContext);
+    const otherBody = await otherRes.json();
+    expect(otherBody.site_key).toBe("other-site-key");
+  });
+
+  it("returns hard 403 when no site key exists for backend and token fails", async () => {
+    delete process.env.TURNSTILE_SITE_KEYS;
     delete process.env.TURNSTILE_SITE_KEY;
     const mockFetch = vi.fn().mockResolvedValueOnce(
       new Response(JSON.stringify({ success: false, "error-codes": ["invalid-input-response"] }), {
@@ -180,7 +229,7 @@ describe("chat proxy function", () => {
     const siteverifyCall = mockFetch.mock.calls[0];
     expect(siteverifyCall[0]).toBe("https://challenges.cloudflare.com/turnstile/v0/siteverify");
     const siteverifyBody = new URLSearchParams(siteverifyCall[1].body.toString());
-    expect(siteverifyBody.get("secret")).toBe("test-secret");
+    expect(siteverifyBody.get("secret")).toBe("nairr-secret");
     expect(siteverifyBody.get("response")).toBe("good-token");
     expect(siteverifyBody.get("remoteip")).toBe("1.2.3.4");
 

@@ -9,31 +9,75 @@ interface SiteverifyResponse {
 }
 
 /**
- * Parse ALLOWED_BACKENDS env var into an ID→URL map.
- * Format: "id1=https://url1,id2=https://url2"
- * The client sends the ID; the server resolves it to a URL.
- * This prevents SSRF — the client never controls the target URL.
+ * Parse a comma-separated "id=value" env var into an ID→value map.
+ * Format: "id1=value1,id2=value2"
  */
-function getBackendMap(): Map<string, string> {
-  const raw = process.env.ALLOWED_BACKENDS ?? "";
+function parseEnvMap(raw: string): Map<string, string> {
   const map = new Map<string, string>();
   for (const entry of raw.split(",")) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
     const eqIdx = trimmed.indexOf("=");
     if (eqIdx === -1) {
-      console.warn(`ALLOWED_BACKENDS: skipping malformed entry (no '='): "${trimmed}"`);
+      console.warn(`Env map: skipping malformed entry (no '='): "${trimmed}"`);
       continue;
     }
     const id = trimmed.slice(0, eqIdx).trim();
-    const url = trimmed.slice(eqIdx + 1).trim();
-    if (!id || !url) {
-      console.warn(`ALLOWED_BACKENDS: skipping entry with empty id or url: "${trimmed}"`);
+    const value = trimmed.slice(eqIdx + 1).trim();
+    if (!id || !value) {
+      console.warn(`Env map: skipping entry with empty id or value: "${trimmed}"`);
       continue;
     }
-    map.set(id, url);
+    map.set(id, value);
   }
   return map;
+}
+
+/**
+ * Parse ALLOWED_BACKENDS env var into an ID→URL map.
+ * Format: "id1=https://url1,id2=https://url2"
+ * The client sends the ID; the server resolves it to a URL.
+ * This prevents SSRF — the client never controls the target URL.
+ */
+function getBackendMap(): Map<string, string> {
+  return parseEnvMap(process.env.ALLOWED_BACKENDS ?? "");
+}
+
+/**
+ * Per-backend Turnstile configuration.
+ *
+ * Each backend can have its own Turnstile widget (different Cloudflare
+ * site key + secret key). This allows ACCESS and NAIRR to use separate
+ * Turnstile widgets with different domain allowlists.
+ *
+ * Env vars (set both maps together — each backend ID in ALLOWED_BACKENDS
+ * should have a matching entry in both TURNSTILE_*_KEYS):
+ *   TURNSTILE_SITE_KEYS="access=0x...,nairr=0x..."
+ *   TURNSTILE_SECRET_KEYS="access=secret1,nairr=secret2"
+ *
+ * Falls back to the single-key env vars (TURNSTILE_SITE_KEY,
+ * TURNSTILE_SECRET_KEY) for backwards compatibility or when all
+ * backends share one widget.
+ */
+function getTurnstileKeys(backendId: string): { siteKey?: string; secretKey?: string } {
+  const siteKeys = parseEnvMap(process.env.TURNSTILE_SITE_KEYS ?? "");
+  const secretKeys = parseEnvMap(process.env.TURNSTILE_SECRET_KEYS ?? "");
+
+  const perBackendSite = siteKeys.get(backendId);
+  const perBackendSecret = secretKeys.get(backendId);
+
+  const siteKey = perBackendSite ?? process.env.TURNSTILE_SITE_KEY;
+  const secretKey = perBackendSecret ?? process.env.TURNSTILE_SECRET_KEY;
+
+  // Warn if one side is per-backend and the other is global — likely misconfiguration
+  if ((perBackendSite && !perBackendSecret) || (!perBackendSite && perBackendSecret)) {
+    console.warn(
+      `Turnstile config for "${backendId}": mixing per-backend and global keys. ` +
+      `Set both TURNSTILE_SITE_KEYS and TURNSTILE_SECRET_KEYS for each backend.`
+    );
+  }
+
+  return { siteKey, secretKey };
 }
 
 async function validateTurnstile(
@@ -91,16 +135,6 @@ export default async function handler(
     return jsonResponse({ error: "Method not allowed" }, 405, cors);
   }
 
-  const secretKey = process.env.TURNSTILE_SECRET_KEY;
-  if (!secretKey) {
-    console.error("TURNSTILE_SECRET_KEY not configured");
-    return jsonResponse({ error: "Server misconfigured" }, 500, cors);
-  }
-
-  // TURNSTILE_SITE_KEY is the public site key — used in challenge responses
-  // so qa-bot-core can show the visible Turnstile widget as a fallback.
-  const siteKey = process.env.TURNSTILE_SITE_KEY;
-
   const backendMap = getBackendMap();
   if (backendMap.size === 0) {
     console.error("ALLOWED_BACKENDS not configured");
@@ -125,11 +159,19 @@ export default async function handler(
   }
 
   // --- Turnstile validation ---
-  // When token is missing or invalid, return a challenge response that
-  // qa-bot-core already understands (qa-flow.tsx:626), triggering the
-  // visible Turnstile widget. This is the fallback when silent
-  // verification hasn't produced a token yet.
+  // Resolve per-backend Turnstile keys. Each backend can have its own
+  // Cloudflare widget so that ACCESS and NAIRR use separate domain
+  // allowlists. Falls back to the global TURNSTILE_* env vars.
+  const { siteKey, secretKey } = getTurnstileKeys(backendId);
 
+  if (!secretKey) {
+    console.error(`No Turnstile secret key for backend "${backendId}"`);
+    return jsonResponse({ error: "Server misconfigured" }, 500, cors);
+  }
+
+  // When token is missing or invalid, return a challenge response that
+  // qa-bot-core already understands (qa-flow.tsx), triggering the
+  // visible Turnstile widget as fallback.
   const turnstileToken = body.turnstile_token as string | undefined;
 
   if (!turnstileToken) {
