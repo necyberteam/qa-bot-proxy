@@ -353,8 +353,118 @@ describe("chat proxy function", () => {
     const backendCall = mockFetch.mock.calls[1];
     expect(backendCall[1].headers["cookie"]).toBe("existing=val");
 
-    // Verify set-cookie was passed back to client
-    expect(res.headers.get("set-cookie")).toBe("session=abc123; Path=/; HttpOnly");
+    // Verify set-cookie includes the backend cookie and our verified cookie
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("session=abc123; Path=/; HttpOnly");
+    expect(setCookie).toContain("qa-verified=");
+  });
+
+  it("skips Turnstile when verified-session cookie is present", async () => {
+    // First: make a verified request to get the cookie
+    const mockFetch1 = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ response: "first answer" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", mockFetch1);
+
+    const handler1 = await loadHandler();
+    const req1 = makeRequest("POST", {
+      _backend: "nairr",
+      turnstile_token: "good-token",
+      query: "q1",
+    });
+    const res1 = await handler1(req1, fakeContext);
+    expect(res1.status).toBe(200);
+
+    // Extract the verified cookie
+    const setCookie = res1.headers.get("set-cookie") ?? "";
+    const cookieMatch = setCookie.match(/qa-verified=([^;,\s]+)/);
+    expect(cookieMatch).toBeTruthy();
+    const cookieValue = cookieMatch![1];
+
+    // Second request: send the verified cookie, NO turnstile_token
+    vi.resetModules();
+    process.env.TURNSTILE_SECRET_KEYS = "nairr=nairr-secret,other=other-secret";
+    process.env.TURNSTILE_SITE_KEYS = "nairr=nairr-site-key,other=other-site-key";
+    process.env.ALLOWED_BACKENDS = "nairr=https://api.example.com/nairr/chat/,other=https://api.other.com/chat/";
+
+    const mockFetch2 = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ response: "second answer" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", mockFetch2);
+
+    const handler2 = await loadHandler();
+    const req2 = makeRequest(
+      "POST",
+      { _backend: "nairr", query: "q2" },
+      { cookie: `qa-verified=${cookieValue}` }
+    );
+    const res2 = await handler2(req2, fakeContext);
+    expect(res2.status).toBe(200);
+
+    const body2 = await res2.json();
+    expect(body2.response).toBe("second answer");
+
+    // Only one fetch (backend) — no siteverify call
+    expect(mockFetch2).toHaveBeenCalledTimes(1);
+    expect(mockFetch2.mock.calls[0][0]).toBe("https://api.example.com/nairr/chat/");
+  });
+
+  it("requires Turnstile when verified cookie is tampered", async () => {
+    const handler = await loadHandler();
+    const req = makeRequest(
+      "POST",
+      { _backend: "nairr", query: "hi" },
+      { cookie: "qa-verified=dGFtcGVyZWQ.invalidsig" }
+    );
+    const res = await handler(req, fakeContext);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.requires_turnstile).toBe(true);
+  });
+
+  it("requires Turnstile when verified cookie is for wrong backend", async () => {
+    // Get a valid cookie for "nairr"
+    const mockFetch1 = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ response: "ok" }), {
+        headers: { "Content-Type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", mockFetch1);
+
+    const handler1 = await loadHandler();
+    const req1 = makeRequest("POST", {
+      _backend: "nairr",
+      turnstile_token: "tok",
+      query: "q1",
+    });
+    const res1 = await handler1(req1, fakeContext);
+    const setCookie = res1.headers.get("set-cookie") ?? "";
+    const cookieMatch = setCookie.match(/qa-verified=([^;,\s]+)/);
+    const cookieValue = cookieMatch![1];
+
+    // Try to use nairr's cookie on "other" backend
+    vi.resetModules();
+    process.env.TURNSTILE_SECRET_KEYS = "nairr=nairr-secret,other=other-secret";
+    process.env.TURNSTILE_SITE_KEYS = "nairr=nairr-site-key,other=other-site-key";
+    process.env.ALLOWED_BACKENDS = "nairr=https://api.example.com/nairr/chat/,other=https://api.other.com/chat/";
+
+    const handler2 = await loadHandler();
+    const req2 = makeRequest(
+      "POST",
+      { _backend: "other", query: "hi" },
+      { cookie: `qa-verified=${cookieValue}` }
+    );
+    const res2 = await handler2(req2, fakeContext);
+    expect(res2.status).toBe(200);
+    const body2 = await res2.json();
+    expect(body2.requires_turnstile).toBe(true);
   });
 
   it("streams SSE responses through", async () => {

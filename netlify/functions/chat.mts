@@ -80,6 +80,84 @@ function getTurnstileKeys(backendId: string): { siteKey?: string; secretKey?: st
   return { siteKey, secretKey };
 }
 
+// --- Verified-session cookie ---
+// After a successful Turnstile validation, we set a signed cookie so
+// subsequent requests from the same browser skip Turnstile entirely.
+// Turnstile tokens are single-use (consumed by siteverify), so without
+// this cookie every request would require a fresh token — but
+// turnstile.reset() is async with no completion signal, causing a race
+// condition where the next request fires before a fresh token is ready.
+
+const VERIFIED_COOKIE = "qa-verified";
+
+/** How long a verified session lasts before re-verification is required.
+ *  Set VERIFIED_SESSION_TTL env var to override (in seconds). Default: 300 (5 min). */
+function getVerifiedTtl(): number {
+  const raw = process.env.VERIFIED_SESSION_TTL;
+  if (!raw) return 300;
+  const n = parseInt(raw, 10);
+  return Number.isNaN(n) || n < 0 ? 300 : n;
+}
+
+async function hmacSign(data: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
+  return btoa(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+async function hmacVerify(data: string, signature: string, secret: string): Promise<boolean> {
+  const expected = await hmacSign(data, secret);
+  return expected === signature;
+}
+
+/** Check if the request has a valid verified-session cookie for this backend. */
+async function isSessionVerified(
+  request: Request,
+  backendId: string,
+  secret: string
+): Promise<boolean> {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) return false;
+
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${VERIFIED_COOKIE}=([^;]+)`));
+  if (!match) return false;
+
+  const raw = match[1];
+  const dotIdx = raw.lastIndexOf(".");
+  if (dotIdx === -1) return false;
+
+  const payload = raw.slice(0, dotIdx);
+  const sig = raw.slice(dotIdx + 1);
+
+  if (!await hmacVerify(payload, sig, secret)) return false;
+
+  try {
+    const data = JSON.parse(atob(payload));
+    if (data.backend !== backendId) return false;
+    if (Date.now() - data.ts > getVerifiedTtl() * 1000) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Build a signed Set-Cookie header value for the verified session. */
+async function buildVerifiedCookie(
+  backendId: string,
+  secret: string
+): Promise<string> {
+  const payload = btoa(JSON.stringify({ backend: backendId, ts: Date.now() }));
+  const sig = await hmacSign(payload, secret);
+  return `${VERIFIED_COOKIE}=${payload}.${sig}; Path=/; Max-Age=${getVerifiedTtl()}; SameSite=None; Secure; HttpOnly`;
+}
+
 async function validateTurnstile(
   token: string,
   secretKey: string,
@@ -158,7 +236,7 @@ export default async function handler(
     return jsonResponse({ error: "Unknown backend: " + backendId }, 403, cors);
   }
 
-  // --- Turnstile validation ---
+  // --- Turnstile validation (with verified-session cookie) ---
   // Resolve per-backend Turnstile keys. Each backend can have its own
   // Cloudflare widget so that ACCESS and NAIRR use separate domain
   // allowlists. Falls back to the global TURNSTILE_* env vars.
@@ -169,40 +247,47 @@ export default async function handler(
     return jsonResponse({ error: "Server misconfigured" }, 500, cors);
   }
 
-  // When token is missing or invalid, return a challenge response that
-  // qa-bot-core already understands (qa-flow.tsx), triggering the
-  // visible Turnstile widget as fallback.
-  const turnstileToken = body.turnstile_token as string | undefined;
+  // Check if this session was already verified via a signed cookie.
+  // This avoids re-challenging on every request (Turnstile tokens are
+  // single-use, and turnstile.reset() is async with no completion signal).
+  let verifiedCookieValue: string | null = null;
+  const alreadyVerified = await isSessionVerified(request, backendId, secretKey);
 
-  if (!turnstileToken) {
-    if (siteKey) {
-      return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
+  if (!alreadyVerified) {
+    const turnstileToken = body.turnstile_token as string | undefined;
+
+    if (!turnstileToken) {
+      if (siteKey) {
+        return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
+      }
+      return jsonResponse({ error: "Missing turnstile_token" }, 403, cors);
     }
-    return jsonResponse({ error: "Missing turnstile_token" }, 403, cors);
-  }
 
-  let verification: SiteverifyResponse;
-  try {
-    verification = await validateTurnstile(
-      turnstileToken,
-      secretKey,
-      context.ip
-    );
-  } catch (err) {
-    console.error("Turnstile siteverify request failed:", err);
-    return jsonResponse({ error: "Turnstile service unavailable" }, 502, cors);
-  }
-
-  if (!verification.success) {
-    console.warn(
-      "Turnstile validation failed:",
-      verification["error-codes"]
-    );
-    // Return challenge so user can retry with visible widget
-    if (siteKey) {
-      return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
+    let verification: SiteverifyResponse;
+    try {
+      verification = await validateTurnstile(
+        turnstileToken,
+        secretKey,
+        context.ip
+      );
+    } catch (err) {
+      console.error("Turnstile siteverify request failed:", err);
+      return jsonResponse({ error: "Turnstile service unavailable" }, 502, cors);
     }
-    return jsonResponse({ error: "Turnstile verification failed" }, 403, cors);
+
+    if (!verification.success) {
+      console.warn(
+        "Turnstile validation failed:",
+        verification["error-codes"]
+      );
+      if (siteKey) {
+        return jsonResponse({ requires_turnstile: true, site_key: siteKey }, 200, cors);
+      }
+      return jsonResponse({ error: "Turnstile verification failed" }, 403, cors);
+    }
+
+    // Turnstile passed — set verified cookie so subsequent requests skip validation
+    verifiedCookieValue = await buildVerifiedCookie(backendId, secretKey);
   }
 
   // Strip proxy-only fields before forwarding
@@ -226,23 +311,31 @@ export default async function handler(
     });
   } catch (err) {
     console.error("Backend request failed:", err);
-    return jsonResponse({ error: "Failed to reach backend" }, 502, cors);
+    // Still emit the verified cookie if Turnstile just succeeded — the token
+    // was already consumed by siteverify, so without the cookie the user
+    // would have to re-challenge after a transient backend outage.
+    const errRes = jsonResponse({ error: "Failed to reach backend" }, 502, cors);
+    if (verifiedCookieValue) {
+      errRes.headers.append("set-cookie", verifiedCookieValue);
+    }
+    return errRes;
   }
 
-  // Build response headers — pass through content type and cookies
-  const responseHeaders: Record<string, string> = {
+  // Build response headers — pass through content type and cookies.
+  // Use Headers object to support multiple Set-Cookie lines (a plain
+  // object can only hold one value per key).
+  const resHeaders = new Headers({
     "Content-Type":
       backendResponse.headers.get("Content-Type") ?? "application/json",
     "Cache-Control": "no-cache",
     ...cors,
-  };
-  const setCookie = backendResponse.headers.get("set-cookie");
-  if (setCookie) {
-    responseHeaders["set-cookie"] = setCookie;
-  }
+  });
+  const backendSetCookie = backendResponse.headers.get("set-cookie");
+  if (backendSetCookie) resHeaders.append("set-cookie", backendSetCookie);
+  if (verifiedCookieValue) resHeaders.append("set-cookie", verifiedCookieValue);
 
   return new Response(backendResponse.body, {
     status: backendResponse.status,
-    headers: responseHeaders,
+    headers: resHeaders,
   });
 }
