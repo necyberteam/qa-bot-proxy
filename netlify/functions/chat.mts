@@ -44,6 +44,27 @@ function getBackendMap(): Map<string, string> {
 }
 
 /**
+ * Parse RAG_BACKENDS env var into a Set of backend IDs whose JSON responses
+ * should be augmented with rating-eligible metadata.
+ *
+ * RAG-only backends return plain `{ "response": "..." }` JSON without the
+ * `metadata.is_final_response` / `metadata.rating_target` fields that
+ * qa-bot-core gates rating UI on. Listing a backend here causes the proxy
+ * to inject those fields so the bot renders thumbs-up/down on answers.
+ *
+ * Format: "id1,id2" (comma-separated). Whitespace is tolerated.
+ * Example: RAG_BACKENDS="nairr,access"
+ */
+function getRagBackends(): Set<string> {
+  return new Set(
+    (process.env.RAG_BACKENDS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+
+/**
  * Per-backend Turnstile configuration.
  *
  * Each backend can have its own Turnstile widget (different Cloudflare
@@ -333,6 +354,51 @@ export default async function handler(
   const backendSetCookie = backendResponse.headers.get("set-cookie");
   if (backendSetCookie) resHeaders.append("set-cookie", backendSetCookie);
   if (verifiedCookieValue) resHeaders.append("set-cookie", verifiedCookieValue);
+
+  // For RAG-only backends, qa-bot-core gates the rating UI on the response
+  // including `metadata.is_final_response: true` and `metadata.rating_target`.
+  // Plain RAG services don't emit those fields, so inject them here. SSE
+  // streams and non-RAG backends fall through unchanged.
+  const upstreamContentType =
+    backendResponse.headers.get("Content-Type") ?? "";
+  const isJsonResponse = upstreamContentType.includes("application/json");
+  const isRagBackend = getRagBackends().has(backendId);
+
+  if (isJsonResponse && isRagBackend && backendResponse.ok) {
+    // Read as text first so we can fall back to passing the raw body through
+    // if it doesn't parse as JSON. Calling .json() and failing leaves the
+    // body stream locked, which would prevent any fallback.
+    const rawBody = await backendResponse.text();
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch (err) {
+      console.warn(
+        `RAG metadata injection: upstream "${backendId}" returned JSON ` +
+          `Content-Type but unparseable body; passing through.`,
+        err
+      );
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const existingMetadata =
+        (parsed.metadata as Record<string, unknown> | undefined) ?? {};
+      parsed.metadata = {
+        is_final_response: true,
+        rating_target: "qa",
+        ...existingMetadata,
+      };
+      return new Response(JSON.stringify(parsed), {
+        status: backendResponse.status,
+        headers: resHeaders,
+      });
+    }
+
+    return new Response(rawBody, {
+      status: backendResponse.status,
+      headers: resHeaders,
+    });
+  }
 
   return new Response(backendResponse.body, {
     status: backendResponse.status,

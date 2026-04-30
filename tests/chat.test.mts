@@ -491,4 +491,155 @@ describe("chat proxy function", () => {
     const text = await res.text();
     expect(text).toContain("event: token");
   });
+
+  describe("RAG metadata injection", () => {
+    it("injects rating metadata into JSON responses for RAG backends", async () => {
+      process.env.RAG_BACKENDS = "nairr";
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ response: "An answer." }), {
+          headers: { "Content-Type": "application/json" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.response).toBe("An answer.");
+      expect(body.metadata).toEqual({
+        is_final_response: true,
+        rating_target: "qa",
+      });
+    });
+
+    it("does not modify JSON responses for backends not in RAG_BACKENDS", async () => {
+      process.env.RAG_BACKENDS = "other";
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ response: "An answer." }), {
+          headers: { "Content-Type": "application/json" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      const body = await res.json();
+      expect(body.response).toBe("An answer.");
+      expect(body.metadata).toBeUndefined();
+    });
+
+    it("does not modify SSE responses even for RAG backends", async () => {
+      process.env.RAG_BACKENDS = "nairr";
+      const sseBody = "event: token\ndata: {\"content\":\"Hello\"}\n\nevent: done\ndata: {}\n\n";
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response(sseBody, {
+          headers: { "Content-Type": "text/event-stream" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      expect(res.headers.get("Content-Type")).toBe("text/event-stream");
+      const text = await res.text();
+      expect(text).toBe(sseBody);
+    });
+
+    it("preserves upstream metadata fields and only fills in missing ones", async () => {
+      process.env.RAG_BACKENDS = "nairr";
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          response: "An answer.",
+          metadata: { rating_target: "agent", custom_field: "keep me" },
+        }), {
+          headers: { "Content-Type": "application/json" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      const body = await res.json();
+      // Upstream's rating_target wins; is_final_response gets filled in.
+      expect(body.metadata).toEqual({
+        is_final_response: true,
+        rating_target: "agent",
+        custom_field: "keep me",
+      });
+    });
+
+    it("does not inject when RAG_BACKENDS is empty", async () => {
+      delete process.env.RAG_BACKENDS;
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ response: "An answer." }), {
+          headers: { "Content-Type": "application/json" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      const body = await res.json();
+      expect(body.metadata).toBeUndefined();
+    });
+
+    it("passes through unparseable JSON bodies without error", async () => {
+      process.env.RAG_BACKENDS = "nairr";
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" },
+        }))
+        .mockResolvedValueOnce(new Response("not valid json", {
+          headers: { "Content-Type": "application/json" },
+        }));
+      vi.stubGlobal("fetch", mockFetch);
+
+      const handler = await loadHandler();
+      const req = makeRequest("POST", {
+        _backend: "nairr",
+        turnstile_token: "tok",
+        query: "hi",
+      });
+      const res = await handler(req, fakeContext);
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toBe("not valid json");
+    });
+  });
 });
